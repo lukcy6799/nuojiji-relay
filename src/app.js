@@ -374,6 +374,20 @@ export function createApp() {
         return c.json({ ok: true });
     });
 
+    // 🖼️ 单独回写一对的角色头像 URL（不重跑整个注册）。
+    //   手机端「检查推送」发现 NO-avatarUrl-registered 时调，补传头像后回写，无需关开主动消息开关。
+    app.post('/proactive/set-avatar', async (c) => {
+        let body;
+        try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
+        const { inboxId, userId, charId, avatarUrl } = body || {};
+        if (!inboxId || userId == null || charId == null) return c.json({ error: 'inboxId / userId / charId required' }, 400);
+        if (typeof avatarUrl !== 'string' || !avatarUrl) return c.json({ error: 'avatarUrl required' }, 400);
+        const { proactive } = await getStores(c.env);
+        const ok = await proactive.patch(inboxId, String(userId), String(charId), { avatarUrl });
+        if (!ok) return c.json({ error: 'pair not registered' }, 404);
+        return c.json({ ok: true });
+    });
+
     app.post('/proactive/unregister', async (c) => {
         let body;
         try { body = await c.req.json(); } catch { return c.json({ error: 'invalid json' }, 400); }
