@@ -29,14 +29,38 @@ function fillTemplate(template, { transcript, reason, memory }) {
         .replaceAll('{{MEMORY_CONTEXT}}', memory || '');
 }
 
+// 单轮 tick 的墙钟预算：Workers scheduled 有 CPU/时长上限，串行遍历所有 pair 同步调 AI
+//   （每个最长 180s）必然超时被杀 → 排后面的 pair 永不触发。给一个保守预算，超了就停，
+//   靠轮转游标下轮接着处理（pairsCursor）。Cloudflare 免费版 CPU 上限较紧，取 25s。
+const TICK_WALL_BUDGET_MS = 25_000;
+
 export async function runProactiveTick(env) {
     const proactive = await createProactiveStore(env);
     const outbox = await createOutboxStore(env);
     const sub = await createSubStore(env);
     const now = nowMs();
+    const tickStart = Date.now();
 
-    const pairs = await proactive.listEnabled();
+    // 🔒 重入锁：Workers scheduled 无重入守卫，tick 超 60s 时下一轮 cron 会并发 → 同一 pair 双发双扣费。
+    //    抢不到锁（已有 tick 在跑）就直接退出本轮。锁带 TTL，tick 崩溃也会自动释放。
+    let lockHeld = false;
+    try { lockHeld = await proactive.acquireTickLock?.(120_000); } catch { lockHeld = true; /* 不支持锁的实现照旧跑 */ }
+    if (lockHeld === false) {
+        return { pairs: 0, fired: 0, skipped: 'locked' };
+    }
+
+    try {
+
+    const allPairs = await proactive.listEnabled();
+    // 🔄 轮转游标：从上轮停下的位置接着处理，保证规模化时每个 pair 最终都轮到（防永远只处理前缀）。
+    let startIdx = 0;
+    try {
+        const cur = await proactive.getTickCursor?.();
+        if (typeof cur === 'number' && cur > 0) startIdx = cur % Math.max(1, allPairs.length);
+    } catch { /* 不支持游标：从 0 开始 */ }
+    const pairs = startIdx > 0 ? [...allPairs.slice(startIdx), ...allPairs.slice(0, startIdx)] : allPairs;
     let fired = 0;
+    let processed = 0;
 
     // inbox 级暂停缓存：用户走线下剧情时手机端调 /proactive/pause，该 inbox 整个跳过本轮生成。
     // 同一 inbox 多对只查一次。
@@ -50,6 +74,12 @@ export async function runProactiveTick(env) {
     }
 
     for (const rec of pairs) {
+        // ⏱️ 墙钟预算：超了就停，剩余 pair 留到下轮（游标已记到 processed 位置）。
+        if (Date.now() - tickStart > TICK_WALL_BUDGET_MS) {
+            console.warn(`[proactive] tick 墙钟预算用尽，本轮处理 ${processed}/${pairs.length}，剩余下轮继续`);
+            break;
+        }
+        processed++;
         try {
             // 走线下剧情中：跳过该 inbox 的所有主动生成（用户在前台沉浸剧情，不该被线上消息打断）
             if (await isInboxPaused(rec.inboxId)) continue;
@@ -86,15 +116,11 @@ export async function runProactiveTick(env) {
             if (!verdict.fire) continue;
 
             // 🔒 先抢占发送槽：在【生成之前】就把 lastFiredAt 推进到 now 落库。
-            //    根因（重复消息真凶之一）：旧码 lastFiredAt 在生成【之后】才 patch（line ~151），
-            //    而 runGeneration 可能耗时数十秒（甚至超过 1 分钟 cron 间隔）。期间下一轮 cron 读到的
-            //    还是旧 lastFiredAt → 冷却闸（line 58）放行 → 同一对用同一份未更新的滑窗/理由【再生成一次】
-            //    → 下一轮主动消息与上一轮内容重复。Workers scheduled 无重入守卫、proactive 路径也无
-            //    requestId 幂等，两轮 cron 完全独立都会发。先抢槽后生成 = 把冷却窗口提前到生成前，
-            //    第二轮 cron 立刻被冷却闸挡住。生成失败下面会把 lastFiredAt 回退，允许下轮正常重试。
-            const claimOk = await proactive.patch(rec.inboxId, rec.userId, rec.charId, { lastFiredAt: now });
-            // patch 失败（pair 已被删/未注册）→ 跳过，别在没占到槽的情况下空生成扣费。
-            if (!claimOk) continue;
+            //    根因（重复消息真凶）：旧码 lastFiredAt 在生成【之后】才写，而 runGeneration 可能耗时数十秒，
+            //    期间下一轮 cron 读到旧 lastFiredAt → 冷却闸放行 → 同一对再生成一次 = 下轮重复上轮。
+            //    ⚠️ 必须走独立的 claimFire（写独立 key `pf:`），不能用 patch(整条 blob)：否则手机端
+            //    sync-messages 的 patch 会用抢槽前的快照覆盖回旧 lastFiredAt → 抢槽被抹掉 → 重复消息复活。
+            await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, now);
 
             // 命中 → 实时生成。messages 只有一条 system（手机端拼好的完整 prompt + 填充滑窗）
             const transcript = renderTranscript(rec.recentMessages);
@@ -134,7 +160,7 @@ export async function runProactiveTick(env) {
             //    失败不入 outbox（手机端对 error item 一律丢弃）、不发推送、不推进 lifeState/streak。
             if (error) {
                 const failMark = now - (BACKEND_FIRE_COOLDOWN_MS - BACKEND_FAIL_COOLDOWN_MS);
-                await proactive.patch(rec.inboxId, rec.userId, rec.charId, { lastFiredAt: failMark });
+                await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, failMark);
                 console.warn('[proactive] generation failed, short cooldown 5min:', error);
                 continue;
             }
@@ -188,9 +214,12 @@ export async function runProactiveTick(env) {
                 if (subs.length) {
                     const title = rec.timeSpec?.charName || '糯叽机';
                     // 🔒 通知隐私模式：正文换「你有一条新消息」，标题(角色名)/头像保留。仍逐气泡发以保持节奏一致。
-                    const bodies = rec.notifPrivacy
+                    // H5：封顶推送条数。气泡数 × 订阅数 = 子请求数，超 Workers 上限(50/1000)后 fetch 抛错
+                    //   被吞 → 静默丢推送。封顶最多 8 条气泡（消息正文不受影响，已全在 outbox），防超限。
+                    const rawBodies = rec.notifPrivacy
                         ? extractPushBodies(content).map(() => '你有一条新消息')
                         : extractPushBodies(content);
+                    const bodies = rawBodies.slice(0, 8);
                     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
                     let i = 0;
                     for (const body of bodies) {
@@ -222,5 +251,16 @@ export async function runProactiveTick(env) {
         }
     }
 
-    return { pairs: pairs.length, fired };
+    // 🔄 保存轮转游标到「本轮处理到的绝对位置」，下轮从这接着扫（防总处理前缀、后面 pair 饿死）。
+    try {
+        const nextCursor = allPairs.length ? (startIdx + processed) % allPairs.length : 0;
+        await proactive.setTickCursor?.(nextCursor);
+    } catch { /* 不支持游标：忽略 */ }
+
+    return { pairs: pairs.length, processed, fired };
+
+    } finally {
+        // 释放重入锁（即使中途抛错也释放，避免锁残留挡住后续 tick；TTL 是二重保险）。
+        try { await proactive.releaseTickLock?.(); } catch { /* ignore */ }
+    }
 }

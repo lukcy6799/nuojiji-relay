@@ -101,8 +101,17 @@ export function createApp() {
 
         const { outbox, sub } = await getStores(c.env);
 
-        // 幂等：同 requestId 在 TTL 内只处理一次
+        // 幂等：同 requestId 在 TTL 内只处理一次。
+        //   H4 修：命中幂等时，若 outbox 里那条结果还在（未被 ack 删）→ 直接【返回它】，让手机端拿到内容；
+        //   只有结果已被取走删除时才回 409。否则旧码一律 409 无内容 → 手机重提交（网络抖/重启）就永久
+        //   拿不到这条回复（6h 内）= 数据丢失。
         if (await outbox.seenRequest(requestId)) {
+            try {
+                const existing = (await outbox.list(inboxId, 0)).find(it => it && String(it.requestId) === String(requestId));
+                if (existing && !existing.error && existing.content) {
+                    return c.json({ accepted: true, requestId, generated: true, replayed: true }, 202);
+                }
+            } catch { /* 查不到就照旧 409 */ }
             return c.json({ duplicate: true, requestId }, 409);
         }
         await outbox.markRequest(requestId);
@@ -335,6 +344,11 @@ export function createApp() {
         } = body || {};
         if (!inboxId || userId == null || charId == null || !promptTemplate || !aiSettings) {
             return c.json({ error: 'inboxId / userId / charId / promptTemplate / aiSettings required' }, 400);
+        }
+        // M6：输入大小封顶，防 KV 值过大(25MB 限制)写失败/存储 bloat。promptTemplate 含人设+世界书，
+        //   正常几 KB~几十 KB；给 256KB 上限足够，超了拒绝（多半是异常/恶意输入）。
+        if (typeof promptTemplate === 'string' && promptTemplate.length > 256 * 1024) {
+            return c.json({ error: 'promptTemplate too large (>256KB)' }, 413);
         }
         const { proactive } = await getStores(c.env);
         await proactive.upsert({
